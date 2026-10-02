@@ -7,6 +7,7 @@ name: Production Health Alarm
 #   homepage  /                  -> 200
 # Bir kontrol ancak iki ardisik denemede (~60 sn arayla) basarisizsa is kirmizi biter ve GitHub bildirim gonderir.
 # `force_fail` (yalniz elle baslatma) bildirim yolunu sinar.
+# 2026-10-02: ilk zamanlanmis kosu baslamadigi icin zamanlama kaydi bu commit'le yenilendi (is mantigi degismedi).
 
 on:
   schedule:
