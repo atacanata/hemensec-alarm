@@ -1,0 +1,318 @@
+name: Daily Site Check
+
+# SITE_CHECK_DAILY_V1 — owner 02.10.2026 17:07: "Evet, ekle (Önerilen)" (verbatim: docs/operations/LOOP_DECISION_LOG_V1.md).
+#
+# Kaynak sablon: ozel repodaki ops/alarm/site-check.yml (kod birebir kopya; yalniz bu baslik yorumu farkli).
+#
+# Gunde bir, yalniz public GET ile owner'in onayladigi dort kontrol:
+#   1. site haritasi 200; icindeki butun adresler (TAM adres) yonlendirmesiz 200
+#   2. urun sayfalarinin yapisal verisi: fiyatsiz sayfada Product blogu yok, fiyatli sayfada var; offers AggregateOffer
+#      ve lowPrice/highPrice sayfadaki gorunen fiyat araligiyla ayni; "Offer" tipi ve puan/yorum isaretlemesi yok;
+#      gorsel https
+#   3. beklenen 8 bant sayfasi site haritasinda; her birinde en az 1, en fazla ilk 5 urun baglantisi yonlendirmesiz 200
+#   4. eski adresler (adim 4, #342: 3 birlestirme + 11 ad degisikligi) 301 ile hedef urune gidiyor, hedef 200
+# Ikinci deneme: 60 sn sonra YALNIZ basarisiz kalemler yeniden olculur; iki denemede de basarisiz olan kalem isi
+# KIRMIZI bitirir ve GitHub bildirim gonderir. Ilk deneme site haritasi dustugu icin olcemediyse ikinci TAM deneme
+# esastir. En fazla 6 paralel istek, 60 sn zaman asimi, ag hatasinda 1 tekrar; 12 dk genel sure siniri (asilirsa ozet
+# yazilir, is kirmizi). /version yalniz ozete yazilir (kontrol degil). Secret YOK, checkout YOK, token yetkisi YOK.
+# `force_fail` (yalniz elle baslatma): bildirim yolunu sinamak icin bilerek basarisiz olur.
+
+on:
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: "Bildirim yolunu sinamak icin bilerek basarisiz ol"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: site-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check sitemap, structured data, band pages, old addresses
+        env:
+          BASE_URL: https://www.hemensec.com
+          FORCE_FAIL: ${{ inputs.force_fail == true }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, time, urllib.error, urllib.request
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime, timezone
+          from urllib.parse import urljoin, urlparse
+
+          BASE = os.environ.get("BASE_URL", "https://www.hemensec.com").rstrip("/")
+          WORKERS, TIMEOUT, RECHECK_WAIT, BUDGET_S = 6, 60, 60, 720
+          EXPECTED_BANDS = [
+              "/robot-supurge-0-17500", "/robot-supurge-17500-25000", "/robot-supurge-25000-35000",
+              "/robot-supurge-35000-plus", "/dikey-supurge-0-5000", "/dikey-supurge-5000-7000",
+              "/dikey-supurge-7000-10000", "/dikey-supurge-10000-plus",
+          ]
+          # Adim 4 (#342, 01.10) eski adresleri: kaynak yol -> beklenen hedef urun kimligi (ad degisikliginde ayni kimlik)
+          OLD_ADDRESSES = [
+              ("/urun/dreame-d9-max-2f106287-d25c-423c-abe6-6959668b0bcb", "345b6ca4-9b46-458d-9065-cdf8f2c033cc"),
+              ("/urun/dreame-l10s-pro-gen-2-38311e32-49e9-4cf3-bd3c-d14cae2bd402", "7064205b-b53b-4661-a054-c1963a4590df"),
+              ("/urun/mova-z60-ultra-roller-complete-63299dd1-420f-480b-a67f-ad63df7f2ab7", "433f0e32-2143-47ab-b905-d1dfaa4b82b9"),
+              ("/urun/dreame-d9-345b6ca4-9b46-458d-9065-cdf8f2c033cc", "345b6ca4-9b46-458d-9065-cdf8f2c033cc"),
+              ("/urun/dreame-l10s-pro-gen-7064205b-b53b-4661-a054-c1963a4590df", "7064205b-b53b-4661-a054-c1963a4590df"),
+              ("/urun/mova-z60-433f0e32-2143-47ab-b905-d1dfaa4b82b9", "433f0e32-2143-47ab-b905-d1dfaa4b82b9"),
+              ("/urun/dreame-l10s-pro-ultra-24c73f5e-4f24-4095-8048-79d709c2ff9a", "24c73f5e-4f24-4095-8048-79d709c2ff9a"),
+              ("/urun/yui-rs16-426ffe69-338b-4730-81e7-f9a06e537340", "426ffe69-338b-4730-81e7-f9a06e537340"),
+              ("/urun/narwal-z10-e14fe419-5f3a-4d90-a0ae-a080ba5cbfc2", "e14fe419-5f3a-4d90-a0ae-a080ba5cbfc2"),
+              ("/urun/mova-e40-c14344d7-1173-4d75-84b7-a236abf1042e", "c14344d7-1173-4d75-84b7-a236abf1042e"),
+              ("/urun/mova-v50-ab79079d-626b-44e4-b48e-d78a6ece1b8d", "ab79079d-626b-44e4-b48e-d78a6ece1b8d"),
+              ("/urun/mova-p50-c9618606-ca07-4274-b7ad-bb5b8b3237be", "c9618606-ca07-4274-b7ad-bb5b8b3237be"),
+              ("/urun/viomi-v5-2c71969d-5ba2-4f30-aae8-f7c20a8eeafd", "2c71969d-5ba2-4f30-aae8-f7c20a8eeafd"),
+              ("/urun/tp-link-rv30-541e89b6-e1db-4816-8df8-dbf78056b541", "541e89b6-e1db-4816-8df8-dbf78056b541"),
+          ]
+          UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+          LD_RE = re.compile(r'<script type="application/ld\+json">\s*(.*?)\s*</script>', re.S)
+          PRICE_RE = re.compile(r'<div class="pd-price">\s*([^<]*?)\s*<small>TL</small>')
+          RANGE_RE = re.compile(r'<div class="pd-pricerange">[^<]*?\s([0-9.]+)\s*[–-]\s*([0-9.]+)\s*TL aral')
+          MEDIAN_RE = re.compile(r'<div class="pd-pricerange">[^<]*piyasa medyan')
+          ANCHOR_RE = re.compile(r'<a\s[^>]*?href="(?:https?://(?:www\.)?hemensec\.com)?(/urun/[^"#?]+)')
+          BAND_RE = re.compile(r"^/(robot|dikey)-supurge-[0-9]")
+          DEADLINE = [time.time() + BUDGET_S]
+
+
+          class _NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+
+          FOLLOW = urllib.request.build_opener()
+          NOFOLLOW = urllib.request.build_opener(_NoRedirect)
+
+
+          def absolute(target):
+              return target if target.startswith(("http://", "https://")) else BASE + target
+
+
+          def label(url):
+              return url[len(BASE):] if url.startswith(BASE + "/") else url
+
+
+          def fetch(target, follow=True):
+              """{url, status, body, final, location, secs}; ag hatasinda bir kez daha dener (HTTP hata kodunda denemez).
+              Genel sure siniri asildiysa istek atmaz: status None, error 'sure siniri'."""
+              url = absolute(target)
+              err = "sure siniri"
+              for attempt in range(2):
+                  if time.time() > DEADLINE[0]:
+                      break
+                  t = time.time()
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "hemensec-site-check/1.1"})
+                      with (FOLLOW if follow else NOFOLLOW).open(req, timeout=TIMEOUT) as r:
+                          return {"url": url, "status": r.status, "body": r.read().decode("utf-8", "replace"),
+                                  "final": r.geturl(), "location": None, "secs": round(time.time() - t, 2)}
+                  except urllib.error.HTTPError as e:
+                      return {"url": url, "status": e.code, "body": "", "final": url,
+                              "location": e.headers.get("Location") if e.headers else None,
+                              "secs": round(time.time() - t, 2)}
+                  except Exception as e:
+                      err = type(e).__name__
+                      if attempt == 0:
+                          time.sleep(2)
+              return {"url": url, "status": None, "body": "", "final": url, "location": None, "secs": None, "error": err}
+
+
+          def tl(text):
+              return int(text.replace(".", ""))
+
+
+          def pdp_problems(body):
+              """Urun sayfasi yapisal veri sozlesmesi (SEO-0, SEO-0b, SEO-0c). Bos liste = sorun yok."""
+              problems, blocks = [], []
+              for raw in LD_RE.findall(body):
+                  try:
+                      blocks.append(json.loads(raw))
+                  except ValueError:
+                      problems.append("ld+json ayristirilamadi")
+              products = [b for b in blocks if isinstance(b, dict) and b.get("@type") == "Product"]
+              m = PRICE_RE.search(body)
+              shown = m.group(1).strip() if m else None
+              priced = shown not in (None, "", "-")
+              if shown is None:
+                  problems.append("fiyat satiri bulunamadi")
+              if priced and not products:
+                  problems.append("fiyatli sayfada Product blogu yok")
+              if not priced and products:
+                  problems.append("fiyatsiz sayfada Product blogu var (SEO-0c)")
+              for p in products:
+                  offers = p.get("offers") if isinstance(p.get("offers"), dict) else {}
+                  if offers.get("@type") != "AggregateOffer":
+                      problems.append("offers AggregateOffer degil")
+                  if '"Offer"' in json.dumps(p, ensure_ascii=False):
+                      problems.append('"@type": "Offer" var')
+                  if "aggregateRating" in p or "review" in p:
+                      problems.append("puan/yorum isaretlemesi var (SEO-0)")
+                  if "image" in p and not str(p["image"]).startswith("https://"):
+                      problems.append("gorsel https degil")
+                  try:
+                      got = (round(float(offers.get("lowPrice"))), round(float(offers.get("highPrice"))))
+                  except (TypeError, ValueError):
+                      problems.append("lowPrice/highPrice sayisal degil")
+                      continue
+                  rng = RANGE_RE.search(body)
+                  if rng:
+                      want = (tl(rng.group(1)), tl(rng.group(2)))
+                  elif MEDIAN_RE.search(body) and priced and re.fullmatch(r"[0-9.]+", shown):
+                      want = (tl(shown), tl(shown))
+                  else:
+                      problems.append("gorunen fiyat araligi bulunamadi")
+                      continue
+                  if got != want:
+                      problems.append("JSON-LD fiyati %s, sayfadaki aralik %s" % (got, want))
+              return problems
+
+
+          def page_status(r):
+              """Durum sorunu: 200 degil ya da TAM adres degisti (alan adi, sema, yol, sorgu)."""
+              if r["status"] == 200 and r["final"] == r["url"]:
+                  return None
+              moved = "" if r["final"] == r["url"] else ", yonlendirme -> " + label(r["final"])
+              return "durum %s%s" % (r["status"], moved)
+
+
+          def structure(r):
+              bad = pdp_problems(r["body"])
+              return "; ".join(bad) if bad else None
+
+
+          def band_links(body):
+              seen = []
+              for href in ANCHOR_RE.findall(body):
+                  if href not in seen:
+                      seen.append(href)
+              return seen[:5]
+
+
+          def old_problem(old, target):
+              r = fetch(old, follow=False)
+              loc = urljoin(absolute(old), r["location"]) if r["location"] else ""
+              ids = UUID_RE.findall(urlparse(loc).path) if loc else []
+              if r["status"] != 301 or not ids or ids[-1] != target:
+                  return "durum %s, hedef %s (beklenen kimlik %s)" % (r["status"], label(loc) if loc else "-", target)
+              t = fetch(loc)
+              if page_status(t):
+                  return "hedef %s %s" % (label(loc), page_status(t))
+              return None
+
+
+          def sitemap_urls():
+              sm = fetch("/sitemap.xml")
+              urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", sm["body"]) if sm["status"] == 200 else []
+              return sm, urls
+
+
+          def full_pass():
+              """Butun kontroller. Donus: ({kalem: (sorun, yeniden_olcum)}, yumusak olcumler, tam_olculdu_mu)."""
+              failures = {}
+              sm, urls = sitemap_urls()
+              n_products = sum(urlparse(u).path.startswith("/urun/") for u in urls)
+              if sm["status"] != 200 or n_products == 0:
+                  failures["sitemap"] = ("site haritasi %s, urun adresi %d" % (sm["status"], n_products), None)
+                  return failures, {}, False
+              with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                  pages = dict(zip(urls, ex.map(fetch, urls)))
+              for u, r in pages.items():
+                  problem = page_status(r)
+                  if problem:
+                      failures["sitemap " + label(u)] = (problem, lambda u=u: page_status(fetch(u)))
+                  elif urlparse(u).path.startswith("/urun/") and structure(r):
+                      failures["yapisal " + label(u)] = (structure(r), lambda u=u: (lambda x: page_status(x) or structure(x))(fetch(u)))
+              by_path = {urlparse(u).path: r for u, r in pages.items() if r["status"] == 200}
+              bands = sorted(set(EXPECTED_BANDS) | {urlparse(u).path for u in urls if BAND_RE.match(urlparse(u).path)})
+              targets = []
+              for band in bands:
+                  if band not in {urlparse(u).path for u in urls}:
+                      failures["bant " + band] = ("site haritasinda yok",
+                                                  lambda band=band: None if band in {urlparse(x).path for x in sitemap_urls()[1]} else "site haritasinda yok")
+                      continue
+                  if band not in by_path:
+                      continue                                          # durum sorunu yukarida kalem oldu
+                  links = band_links(by_path[band]["body"])
+                  if not links:
+                      failures["bant " + band] = ("urun baglantisi yok",
+                                                  lambda band=band: None if band_links(fetch(band)["body"]) else "urun baglantisi yok")
+                  targets.extend((band, href) for href in links)
+              extra = sorted({h for _, h in targets if absolute(h) not in pages})
+              with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                  pages.update(dict(zip([absolute(h) for h in extra], ex.map(fetch, extra))))
+              unpriced_top = 0
+              for band, href in targets:
+                  r = pages[absolute(href)]
+                  problem = page_status(r)
+                  if problem:
+                      failures["bant %s -> %s" % (band, href)] = (problem, lambda href=href: page_status(fetch(href)))
+                  elif not PRICE_RE.search(r["body"]) or PRICE_RE.search(r["body"]).group(1).strip() == "-":
+                      unpriced_top += 1
+              with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                  olds = list(ex.map(lambda item: old_problem(*item), OLD_ADDRESSES))
+              for (old, target), problem in zip(OLD_ADDRESSES, olds):
+                  if problem:
+                      failures["eski adres " + old] = (problem, lambda old=old, target=target: old_problem(old, target))
+              secs = sorted(r["secs"] for r in pages.values() if r.get("secs") is not None)
+              soft = {"sitemap_urls": len(urls), "product_pages": n_products,
+                      "product_pages_without_product_block": sum(
+                          1 for u in urls if urlparse(u).path.startswith("/urun/") and '"@type": "Product"' not in pages[u]["body"]),
+                      "band_pages": len(bands), "band_top5_links": len(targets), "band_top5_without_price": unpriced_top,
+                      "median_secs": secs[len(secs) // 2] if secs else None,
+                      "p90_secs": secs[int(len(secs) * 0.9)] if secs else None}
+              return failures, soft, True
+
+
+          def main():
+              started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              lines = ["## hemensec.com gunluk site kontrolu", "", "Baslangic: %s" % started]
+              if os.environ.get("FORCE_FAIL") == "true":
+                  lines.append("force_fail: bildirim yolu sinamasi; is bilerek kirmizi.")
+                  code = 1
+              else:
+                  t0 = time.time()
+                  ver = fetch("/version")
+                  try:
+                      sha = json.loads(ver["body"]).get("commit_sha") if ver["status"] == 200 else None
+                  except ValueError:
+                      sha = None
+                  lines.append("Surum (/version, kontrol degil): %s" % sha)
+                  first, soft, complete = full_pass()
+                  failures = {}
+                  if first:
+                      time.sleep(RECHECK_WAIT)                       # gecici hatayi alarm saymamak icin ikinci deneme
+                      if not complete:                               # ilk deneme olcemedi: ikinci TAM deneme esas
+                          second, soft, _ = full_pass()
+                          failures = {k: m for k, (m, _) in second.items()}
+                      else:                                          # yalniz basarisiz kalemler yeniden olculur
+                          keys = sorted(first)
+                          with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                              again = list(ex.map(lambda k: first[k][1]() if first[k][1] else first[k][0], keys))
+                          failures = {k: m for k, m in zip(keys, again) if m}
+                  if time.time() > DEADLINE[0]:
+                      failures["sure siniri"] = "genel sure siniri (%d sn) asildi; olcum eksik" % BUDGET_S
+                  code = 1 if failures else 0
+                  lines.append("Sonuc: %s (%d kalici sorun; ilk denemede %d)" % ("KIRMIZI" if code else "TAMAM", len(failures), len(first)))
+                  lines += ["", "| Kalem | Sorun |", "|---|---|"] + ["| %s | %s |" % kv for kv in sorted(failures.items())]
+                  lines += ["", "Yumusak olcumler (alarm degil): " + json.dumps(soft, ensure_ascii=False),
+                            "Sure: %.0f sn" % (time.time() - t0)]
+              text = "\n".join(lines) + "\n"
+              print(text)
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as fh:
+                      fh.write(text)
+              sys.exit(code)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
