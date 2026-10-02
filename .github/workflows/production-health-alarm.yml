@@ -1,0 +1,105 @@
+name: Production Health Alarm
+
+# hemensec.com dis saglik yoklamasi (15 dakikada bir). Yalniz public GET; secret ve token yetkisi yok.
+#   process   /health            -> 200, status ok
+#   database  /health/db         -> 200, DB_CANARY_OK
+#   freshness /health/freshness  -> 200, FRESHNESS_OK (fiyat tazeleme ve gece hesabi yasiyor)
+#   homepage  /                  -> 200
+# Bir kontrol ancak iki ardisik denemede (~60 sn arayla) basarisizsa is kirmizi biter ve GitHub bildirim gonderir.
+# `force_fail` (yalniz elle baslatma) bildirim yolunu sinar.
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: "Bildirim yolunu sinamak icin bilerek basarisiz ol"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: production-health-alarm
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Probe production (2 attempts, ~60 s apart)
+        env:
+          BASE_URL: https://www.hemensec.com
+          FORCE_FAIL: ${{ inputs.force_fail == true }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+
+          BASE = os.environ["BASE_URL"]
+          CHECKS = (
+              ("process", "/health", lambda s, b: s == 200 and b.get("status") == "ok"),
+              ("database", "/health/db", lambda s, b: s == 200 and b.get("code") == "DB_CANARY_OK"),
+              ("freshness", "/health/freshness", lambda s, b: s == 200 and b.get("code") == "FRESHNESS_OK"),
+              ("homepage", "/", lambda s, b: s == 200),
+          )
+
+          def fetch(path):
+              req = urllib.request.Request(BASE + path, headers={"User-Agent": "hemensec-health-alarm"})
+              t0 = time.monotonic()
+              try:
+                  with urllib.request.urlopen(req, timeout=12) as r:
+                      status, raw = r.status, r.read()
+              except urllib.error.HTTPError as e:
+                  status, raw = e.code, e.read()
+              except Exception as e:
+                  return None, {}, round(time.monotonic() - t0, 2), type(e).__name__
+              try:
+                  body = json.loads(raw) if path != "/" else {}
+              except Exception:
+                  body = {}
+              if not isinstance(body, dict):
+                  body = {}
+              return status, body, round(time.monotonic() - t0, 2), ""
+
+          def attempt():
+              res = {}
+              for name, path, ok in CHECKS:
+                  status, body, secs, err = fetch(path)
+                  res[name] = {"ok": bool(status is not None and ok(status, body)), "status": status,
+                               "secs": secs, "err": err, "code": body.get("code"), "signals": body.get("signals")}
+              return res
+
+          first = attempt()
+          second = None
+          if not all(v["ok"] for v in first.values()):
+              time.sleep(60)
+              second = attempt()
+          failed = [n for n in first if not first[n]["ok"] and not (second or first)[n]["ok"]]
+
+          lines = ["## Production Health Alarm", "", "| kontrol | deneme 1 | deneme 2 |", "|---|---|---|"]
+          for n in first:
+              def cell(r):
+                  return f"{'OK' if r['ok'] else 'HATA'} {r['status']} {r['secs']} sn {r['code'] or ''} {r['err']}".strip()
+              lines.append(f"| {n} | {cell(first[n])} | {cell(second[n]) if second else '—'} |")
+          sig = (second or first)["freshness"]["signals"]
+          if sig:
+              lines += ["", "Tazelik sinyalleri (sa / esik):", ""]
+              lines += [f"- {k}: {v.get('age_h')} / {v.get('max_h')} {'OK' if v.get('ok') else 'BAYAT'}" for k, v in sig.items()]
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+
+          if failed:
+              for n in failed:
+                  print(f"::error title=Production health: {n}::{n} iki ardisik denemede basarisiz")
+              sys.exit(1)
+          if second:
+              print("::warning title=Production health::ilk deneme basarisiz, ikinci deneme gecti (gecici)")
+          if os.environ.get("FORCE_FAIL") == "true":
+              print("::error title=Production health: TEST::Bilerek basarisiz (bildirim yolu sinamasi; site saglikli)")
+              sys.exit(1)
+          PY

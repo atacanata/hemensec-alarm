@@ -1,0 +1,31 @@
+name: Keepalive
+
+# GitHub, 60 gun etkinlik olmayan herkese acik repoda zamanlanmis isleri kapatir. Ayda bir yalniz KEEPALIVE.md'ye zaman
+# damgasi yazilip commit'lenir; alarm isinin cron satirina dokunulmaz. Yetki: yalniz bu reponun icerigine yazma.
+
+on:
+  schedule:
+    - cron: '17 4 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch KEEPALIVE.md and push
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > KEEPALIVE.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add KEEPALIVE.md
+          git commit -m "keepalive: $(date -u +%Y-%m-%d)"
+          git push
